@@ -1,20 +1,29 @@
 package com.hust.restclient.controller;
 
+import java.util.Arrays;
+import java.util.Map;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.hust.restclient.dto.AuthenticationResponse;
+import com.hust.restclient.dto.CasLoginResult;
+import com.hust.restclient.dto.CasUserDetail;
 import com.hust.restclient.dto.LoginRequest;
 import com.hust.restclient.dto.LoginResponse;
 import com.hust.restclient.service.CasRestClient;
+
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
-import org.springframework.web.bind.annotation.*;
 
 @Slf4j
 @RestController
@@ -22,16 +31,17 @@ import org.springframework.web.bind.annotation.*;
 @RequiredArgsConstructor
 @CrossOrigin(origins = "*")
 public class AuthController {
-    
+
     private final CasRestClient casRestClient;
     
     @PostMapping("/login")
     public ResponseEntity<LoginResponse> login(@Valid @RequestBody LoginRequest loginRequest, 
-                                             HttpServletResponse response) {
+                                             HttpServletResponse response,
+                                             HttpServletRequest request) {
         log.info("Login attempt for user: {}", loginRequest.getUsername());
         
         try {
-            CasRestClient.CasLoginResult result = casRestClient.performCasLogin(
+            CasLoginResult result = casRestClient.performCasLogin(
                 loginRequest.getUsername(), 
                 loginRequest.getPassword()
             );
@@ -40,18 +50,29 @@ public class AuthController {
                 // Set CASTGC cookie in response
                 response.setHeader("Set-Cookie", result.getCastgcCookie());
                 
-                LoginResponse loginResponse = LoginResponse.success(
-                    result.getServiceTicket(), 
-                    result.getCastgcCookie()
-                );
+                // Get user details from login result (already validated)
+                CasUserDetail userDetail = result.getUserDetail();
+                String actualRole = "USER"; // Default role
+                if (userDetail != null && userDetail.getRole() != null) {
+                    actualRole = userDetail.getRole();
+                }
                 
-                log.info("Login successful for user: {}", loginRequest.getUsername());
+                // Store authentication in HTTP session with CORRECT role
+                HttpSession session = request.getSession(true);
+                session.setAttribute("authenticated_username", loginRequest.getUsername());
+                session.setAttribute("user_role", actualRole); // Use actual role from CAS
+                session.setAttribute("cas_tgt", extractTgtFromCookie(result.getCastgcCookie()));
+                session.setMaxInactiveInterval(30 * 60); // 30 minutes
+                
+                log.info("User {} logged in successfully with role: {}, session created: {}", 
+                        loginRequest.getUsername(), actualRole, session.getId());
+                
+                LoginResponse loginResponse = LoginResponse.success(
+                    result.getServiceTicket()
+                );
                 return ResponseEntity.ok(loginResponse);
                 
             } else {
-                log.warn("Login failed for user: {}. Reason: {}", 
-                    loginRequest.getUsername(), result.getMessage());
-                
                 LoginResponse loginResponse = LoginResponse.failure(result.getMessage());
                 return ResponseEntity.badRequest().body(loginResponse);
             }
@@ -63,31 +84,106 @@ public class AuthController {
         }
     }
     
-    @GetMapping("/health")
-    public ResponseEntity<String> health() {
-        return ResponseEntity.ok("CAS Client is running");
+    private String extractTgtFromCookie(String castgcCookie) {
+        // Extract TGT from "CASTGC=TGT-123-abc; Path=/; Secure; HttpOnly"
+        if (castgcCookie != null && castgcCookie.startsWith("CASTGC=")) {
+            String value = castgcCookie.substring(7); // Remove "CASTGC="
+            int semicolonIndex = value.indexOf(';');
+            return semicolonIndex > 0 ? value.substring(0, semicolonIndex) : value;
+        }
+        return null;
     }
-    
-    @GetMapping("/config")
-    public ResponseEntity<String> config() {
-        return ResponseEntity.ok("CAS Server URL: " + casRestClient.getCasConfig().getServerUrl() + 
-                               ", CAS Client Service URL: " + casRestClient.getCasConfig().getClientServiceUrl());
-    }
-    
-    @GetMapping("/test-ssl")
-    public ResponseEntity<String> testSsl() {
-        try {
-            String testUrl = casRestClient.getCasConfig().getServerUrl() + "login";
-            log.info("Testing SSL connection to: {}", testUrl);
+
+    @PostMapping("authen")
+    public ResponseEntity<AuthenticationResponse> authenticate(HttpServletRequest request){
+        try{
+            Cookie[] cookies = request.getCookies();
+            String castgc = null;
+            if (cookies != null) {
+                castgc = Arrays.stream(cookies)
+                        .filter(c -> "CASTGC".equals(c.getName()))
+                        .map(Cookie::getValue)
+                        .findFirst()
+                        .orElse(null);
+            }
+            if (castgc == null) {
+                return ResponseEntity.notFound().build();
+            }
             
-            // Simple GET request to test SSL connection
-            ResponseEntity<String> response = casRestClient.getRestTemplate().getForEntity(testUrl, String.class);
-            log.info("SSL test successful. Status: {}", response.getStatusCode());
-            return ResponseEntity.ok("SSL connection successful. Status: " + response.getStatusCode());
+            // Get service ticket using TGT
+            String serviceTicket = casRestClient.requestServiceTicket(
+                castgc, 
+                casRestClient.getCasConfig().getClientServiceUrl(),
+                null, 
+                null
+            );
+            
+            if (serviceTicket == null) {
+                AuthenticationResponse authenResponse = AuthenticationResponse.failure("Invalid session");
+                return ResponseEntity.badRequest().body(authenResponse);
+            }
+            
+            // Validate service ticket and get user details
+            CasUserDetail userDetail = casRestClient.validateServiceTicket(
+                serviceTicket, 
+                casRestClient.getCasConfig().getClientServiceUrl()
+            );
+            
+            if (userDetail.isSuccess()) {
+                log.info("User authenticated: {} with role: {}", userDetail.getUsername(), userDetail.getRole());
+                return ResponseEntity.ok(AuthenticationResponse.success(
+                    serviceTicket, 
+                    userDetail.getUsername(), 
+                    userDetail.getRole()
+                ));
+            } else {
+                AuthenticationResponse authenResponse = AuthenticationResponse.failure("Authentication failed");
+                return ResponseEntity.badRequest().body(authenResponse);
+            }
             
         } catch (Exception e) {
-            log.error("SSL test failed", e);
-            return ResponseEntity.status(500).body("SSL connection failed: " + e.getMessage());
+            log.error("Unexpected error during authenticating the user", e);
+            AuthenticationResponse authenResponse = AuthenticationResponse.failure("Internal server error");
+            return ResponseEntity.internalServerError().body(authenResponse);
+        }
+    }
+    
+    @PostMapping("/logout")
+    public ResponseEntity<Map<String, String>> logout(HttpServletRequest request, HttpServletResponse response) {
+        try {
+            // Invalidate HTTP session
+            HttpSession session = request.getSession(false);
+            if (session != null) {
+                String username = (String) session.getAttribute("authenticated_username");
+                session.invalidate();
+                log.info("Session invalidated for user: {}", username);
+            }
+            
+            // Clear CASTGC cookie
+            Cookie castgcCookie = new Cookie("CASTGC", "");
+            castgcCookie.setMaxAge(0);
+            castgcCookie.setPath("/");
+            castgcCookie.setHttpOnly(true);
+            response.addCookie(castgcCookie);
+            
+            // Clear JSESSIONID cookie
+            Cookie jsessionCookie = new Cookie("JSESSIONID", "");
+            jsessionCookie.setMaxAge(0);
+            jsessionCookie.setPath("/");
+            jsessionCookie.setHttpOnly(true);
+            response.addCookie(jsessionCookie);
+            
+            return ResponseEntity.ok(Map.of(
+                "message", "Logout successful",
+                "action", "redirect_to_login"
+            ));
+            
+        } catch (Exception e) {
+            log.error("Error during logout", e);
+            return ResponseEntity.internalServerError().body(Map.of(
+                "error", "Logout failed",
+                "message", "Internal server error"
+            ));
         }
     }
 } 

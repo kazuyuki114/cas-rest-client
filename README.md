@@ -1,120 +1,211 @@
-# CAS Client with REST Protocol
 
-This is a Spring Boot application that implements a CAS (Central Authentication Service) client using the REST protocol.
+# CAS REST Client (Spring Boot)
 
-## Flow Overview
+This project is a Spring Boot application that acts as a client for a Central Authentication Service (CAS) server using the REST protocol. It demonstrates how to authenticate users against a CAS server and manage authentication tickets programmatically.
 
-1. **Credentials from frontend to backend** - Frontend sends username/password to the backend
-2. **TGT request** - Backend requests a Ticket Granting Ticket from CAS server
-3. **ST request** - Backend requests a Service Ticket using the TGT
-4. **ST validation** - Backend validates the Service Ticket with CAS server
-5. **Browser receives CASTGC cookie** - On successful validation, CASTGC cookie is set
-6. **Backend returns login success** - Backend returns success response to frontend
+## Features
 
-## Configuration
+- Authenticate users via CAS REST API
+- Obtain Ticket Granting Ticket (TGT) and Service Ticket (ST)
+- Validate service tickets
+- Issue CASTGC cookie for SSO
+- Exposes a RESTful login endpoint for frontend integration
 
-Update `src/main/resources/application.properties`:
+## Technology Stack
 
-```properties
-# CAS Configuration
-cas.server.url=https://localhost:8080/cas
-cas.client.service.url=http://localhost:8081
-server.port=8081
+- Java 21
+- Spring Boot 3.5.x
+- Spring Security
+- Maven
+
+## Quick Start
+
+1. **Clone the repository**
+2. **Configure CAS server URL and client service URL** in `src/main/resources/application.properties`:
+
+   ```properties
+   cas.server.url=https://localhost:8080/cas
+   cas.client.service.url=http://localhost:8081
+   server.port=8081
+   ```
+
+3. **Start your CAS server** (default: `https://localhost:8080/cas`)
+4. **Run the application:**
+   ```bash
+   ./mvnw spring-boot:run
+   ```
+5. The backend will be available at `http://localhost:8081`
+
+## API Usage
+
+### Login Endpoint
+
+- **URL:** `POST /api/auth/login`
+- **Content-Type:** `application/json`
+- **Request Body:**
+  ```json
+  {
+    "username": "your_username",
+    "password": "your_password"
+  }
+  ```
+- **Success Response:**
+  ```json
+  {
+    "success": true,
+    "message": "Login successful",
+    "serviceTicket": "ST-..."
+  }
+  ```
+
+### Authentication Check Endpoint
+
+- **URL:** `POST /api/auth/authen`
+- **Description:** Validates the user's session using CASTGC cookie
+- **Headers:** Requires CASTGC cookie to be present
+- **Success Response:**
+  ```json
+  {
+    "success": true,
+    "message": "Authenticate successful",
+    "serviceTicket": "ST-...",
+    "username": "admin",
+    "role": "ADMIN"
+  }
+  ```
+
+### Service Ticket Validation Endpoint
+
+- **URL:** `POST /api/auth/validate`
+- **Content-Type:** `application/json`
+- **Request Body:**
+  ```json
+  {
+    "serviceTicket": "ST-...",
+    "service": "http://localhost:8081"
+  }
+  ```
+- **Success Response:**
+  ```json
+  {
+    "success": true,
+    "username": "admin",
+    "role": "ADMIN"
+  }
+  ```
+
+## How It Works
+
+1. **Frontend sends credentials** to `/api/auth/login`.
+2. **Backend requests TGT** from CAS server (`/v1/tickets`).
+3. **Backend requests ST** using TGT (`/v1/tickets/{tgt}`).
+4. **Backend validates ST** (`/serviceValidate`) and parses XML response to extract username and role.
+5. **CASTGC cookie** is set in the response for SSO.
+6. **Login response** is returned to the frontend.
+
+## CAS XML Response Parsing
+
+The application parses the CAS validation response XML to extract user information:
+
+```xml
+<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>
+    <cas:authenticationSuccess>
+        <cas:user>admin</cas:user>
+        <cas:attributes>
+            <cas:groupMembership>ADMIN</cas:groupMembership>
+            <!-- other attributes -->
+        </cas:attributes>
+    </cas:authenticationSuccess>
+</cas:serviceResponse>
 ```
 
-## API Endpoints
+The service extracts:
+- **Username** from `<cas:user>` element
+- **Role** from `<cas:groupMembership>` element
 
-### Login API
-- **URL**: `POST /api/auth/login`
-- **Content-Type**: `application/json`
-- **Request Body**:
-```json
-{
-  "username": "your_username",
-  "password": "your_password"
-}
-```
+## Role-Based API Access Control
 
-- **Success Response**:
-```json
-{
-  "success": true,
-  "message": "Login successful",
-  "serviceTicket": "ST-1234567890abcdef",
-  "castgcCookie": "CASTGC=TGT-1234567890abcdef; Path=/; Secure; HttpOnly"
-}
-```
+The application implements role-based access control using Spring Security. After CAS validation, users are automatically authenticated with their roles:
 
-- **Failure Response**:
-```json
-{
-  "success": false,
-  "message": "Failed to obtain TGT"
-}
-```
+### Available Endpoints by Role
 
-### Health Check
-- **URL**: `GET /api/auth/health`
-- **Response**: `"CAS Client is running"`
+#### Public Endpoints (No Authentication Required)
+- `POST /api/auth/login` - User login
+- `POST /api/auth/validate` - Service ticket validation
 
-## Testing
+#### User Endpoints (Requires USER or ADMIN role)
+- `GET /api/user/profile` - Get user profile
+- `GET /api/user/dashboard` - Get user dashboard
+- `POST /api/user/settings` - Update user settings
 
-### Using curl
+#### Admin Endpoints (Requires ADMIN role only)
+- `GET /api/admin/users` - Get all users
+- `POST /api/admin/system/config` - Update system configuration
+- `GET /api/admin/reports` - Get admin reports
+
+#### Authenticated Endpoints (Any valid user)
+- `POST /api/auth/authen` - Check authentication status
+
+### How Role-Based Filtering Works
+
+1. **Request Interception**: The `RoleBasedAuthFilter` intercepts all requests
+2. **Cookie Validation**: Extracts and validates the CASTGC cookie
+3. **User Details Retrieval**: Gets username and role from CAS validation
+4. **Spring Security Context**: Sets authentication with proper authorities
+5. **Access Control**: Spring Security enforces role-based access rules
+
+### Testing Role-Based Access
+
 ```bash
-# Test login
+# Login as admin user
 curl -X POST http://localhost:8081/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"your_username","password":"your_password"}' \
-  -v
+  -d '{"username":"admin","password":"password"}' \
+  -c cookies.txt
 
-# Test health check
-curl http://localhost:8081/api/auth/health
+# Access admin endpoint (should work for ADMIN role)
+curl -X GET http://localhost:8081/api/admin/users \
+  -b cookies.txt
+
+# Access user endpoint (should work for both USER and ADMIN roles)  
+curl -X GET http://localhost:8081/api/user/profile \
+  -b cookies.txt
 ```
-
-### Using Postman
-1. Create a new POST request to `http://localhost:8081/api/auth/login`
-2. Set Content-Type header to `application/json`
-3. Add request body:
-```json
-{
-  "username": "your_username",
-  "password": "your_password"
-}
-```
-
-## Running the Application
-
-1. Make sure your CAS server is running on `https://localhost:8080/cas`
-2. Start the Spring Boot application:
-```bash
-./mvnw spring-boot:run
-```
-3. The application will start on `http://localhost:8081`
 
 ## Project Structure
 
 ```
 src/main/java/com/hust/restclient/
-├── config/
-│   ├── CasConfig.java          # CAS configuration
-│   ├── SecurityConfig.java     # Security configuration
-│   └── WebConfig.java          # Web configuration
-├── controller/
-│   └── AuthController.java     # REST API endpoints
-├── dto/
-│   ├── LoginRequest.java       # Login request DTO
-│   └── LoginResponse.java      # Login response DTO
-├── service/
-│   └── CasRestClient.java      # CAS REST client service
-└── RestclientApplication.java  # Main application class
+├── config/           # CAS, Security, SSL, and Web configuration
+├── controller/       # REST API endpoints (AuthController, AdminController, UserController)
+├── dto/              # Data Transfer Objects (LoginRequest, LoginResponse, etc.)
+├── security/         # Role-based authentication filter
+├── service/          # CAS REST client logic (CasRestClient)
+└── RestclientApplication.java  # Main Spring Boot application
 ```
 
-## CAS REST Protocol Implementation
+## Security Features
 
-The application implements the CAS REST protocol with the following steps:
+- **CAS REST Authentication**: Seamless integration with CAS server
+- **Role-Based Access Control**: Automatic role extraction and enforcement
+- **Session Management**: CASTGC cookie-based SSO
+- **Method-Level Security**: `@PreAuthorize` annotations for fine-grained control
+- **Automatic User Context**: Spring Security authentication context
 
-1. **TGT Request**: POST to `/v1/tickets` with username/password
-2. **ST Request**: POST to `/v1/tickets/{tgt}` with service URL
-3. **ST Validation**: GET to `/serviceValidate` with ticket and service parameters
+## Dependencies
 
-The CASTGC cookie is automatically set in the response headers for successful logins. 
+- spring-boot-starter-web
+- spring-boot-starter-security
+- spring-boot-starter-validation
+- spring-boot-starter-webflux
+- lombok
+- spring-boot-devtools (optional, for development)
+- spring-boot-starter-test (test scope)
+
+## SSL & Security
+
+The application is pre-configured for SSL and debug logging. See `application.properties` and `config/SslConfig.java` for details. You may need to trust the CAS server's certificate in your environment.
+
+## License
+
+MIT or as specified in the repository.

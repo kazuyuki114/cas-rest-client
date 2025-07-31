@@ -1,8 +1,10 @@
 package com.hust.restclient.service;
 
-import com.hust.restclient.config.CasConfig;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import java.io.ByteArrayInputStream;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -12,10 +14,18 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
+import com.hust.restclient.config.CasConfig;
+import com.hust.restclient.dto.CasAuthenResult;
+import com.hust.restclient.dto.CasLoginResult;
+import com.hust.restclient.dto.CasUserDetail;
+
+import lombok.RequiredArgsConstructor;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 @Service
@@ -24,15 +34,11 @@ public class CasRestClient {
     
     private final CasConfig casConfig;
     private final RestTemplate restTemplate;
-    
+
     public CasConfig getCasConfig() {
         return casConfig;
     }
-    
-    public RestTemplate getRestTemplate() {
-        return restTemplate;
-    }
-    
+
     /**
      * Step 1: Request TGT (Ticket Granting Ticket)
      */
@@ -98,8 +104,10 @@ public class CasRestClient {
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
         
         MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
-        body.add("username", username);
-        body.add("password", password);
+        if(username != null && !username.trim().isEmpty() && password != null && !password.trim().isEmpty()) {
+            body.add("username", username);
+            body.add("password", password);
+        }
         // Don't URL-encode the service URL in the request body
         body.add("service", service);
         log.info("ST request body: {}", body);
@@ -125,10 +133,6 @@ public class CasRestClient {
             
         } catch (Exception e) {
             log.error("Error requesting service ticket", e);
-            log.error("Error details: {}", e.getMessage());
-            if (e.getCause() != null) {
-                log.error("Root cause: {}", e.getCause().getMessage());
-            }
             return null;
         }
     }
@@ -136,9 +140,8 @@ public class CasRestClient {
     /**
      * Step 3: Validate Service Ticket
      */
-    public boolean validateServiceTicket(String serviceTicket, String service) {
+    public CasUserDetail validateServiceTicket(String serviceTicket, String service) {
         String validateUrl = casConfig.getServerUrl() + "serviceValidate";
-        // Don't URL-encode the service URL for validation
         String fullUrl = validateUrl + "?ticket=" + serviceTicket + "&service=" + service;
         log.info("Validating Service Ticket at URL: {}", fullUrl);
         
@@ -147,18 +150,89 @@ public class CasRestClient {
             
             if (response.getStatusCode().is2xxSuccessful()) {
                 String responseBody = response.getBody();
-                // Check if validation was successful (contains <cas:authenticationSuccess>)
-                boolean isValid = responseBody != null && responseBody.contains("<cas:authenticationSuccess>");
-                log.info("Service ticket validation result: {}", isValid);
-                return isValid;
+                log.info("Validation response: {}", responseBody);
+                
+                if (responseBody != null && responseBody.contains("<cas:authenticationSuccess>")) {
+                    return parseUserDetailFromXml(responseBody);
+                } else {
+                    log.warn("Authentication failed in CAS response");
+                    return CasUserDetail.failure();
+                }
             }
             
             log.error("Failed to validate service ticket. Status: {}", response.getStatusCode());
-            return false;
+            return CasUserDetail.failure();
             
         } catch (Exception e) {
             log.error("Error validating service ticket", e);
-            return false;
+            return CasUserDetail.failure();
+        }
+    }
+
+    private CasUserDetail parseUserDetailFromXml(String xmlResponse) {
+        try {
+            log.info("=== PARSING CAS XML RESPONSE ===");
+            log.info("Full XML Response: {}", xmlResponse);
+            
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            Document doc = builder.parse(new ByteArrayInputStream(xmlResponse.getBytes()));
+            
+            // Extract username
+            NodeList userNodes = doc.getElementsByTagName("cas:user");
+            String username = null;
+            if (userNodes.getLength() > 0) {
+                username = userNodes.item(0).getTextContent().trim();
+                log.info("Extracted username: {}", username);
+            } else {
+                log.warn("No cas:user element found in XML");
+            }
+            
+            // Extract role from groupMembership
+            String role = null;
+            NodeList attributeNodes = doc.getElementsByTagName("cas:attributes");
+            log.info("Found {} cas:attributes nodes", attributeNodes.getLength());
+            
+            if (attributeNodes.getLength() > 0) {
+                Element attributesElement = (Element) attributeNodes.item(0);
+                NodeList groupNodes = attributesElement.getElementsByTagName("cas:groupMembership");
+                log.info("Found {} cas:groupMembership nodes", groupNodes.getLength());
+                
+                if (groupNodes.getLength() > 0) {
+                    role = groupNodes.item(0).getTextContent().trim();
+                    log.info("Extracted role from cas:groupMembership: {}", role);
+                } else {
+                    log.warn("No cas:groupMembership element found in cas:attributes");
+                    
+                    // Debug: Let's see what attributes ARE available
+                    NodeList allChildren = attributesElement.getChildNodes();
+                    log.info("Available attribute elements:");
+                    for (int i = 0; i < allChildren.getLength(); i++) {
+                        if (allChildren.item(i).getNodeType() == org.w3c.dom.Node.ELEMENT_NODE) {
+                            log.info("  - Element: {} = {}", 
+                                allChildren.item(i).getNodeName(), 
+                                allChildren.item(i).getTextContent());
+                        }
+                    }
+                }
+            } else {
+                log.warn("No cas:attributes element found in XML - user may not have role information");
+            }
+            
+            if (username != null) {
+                log.info("Extracted user details: username={}, role={}", username, role);
+                CasUserDetail userDetail = CasUserDetail.success(username, role);
+                log.info("Created CasUserDetail: success={}, username={}, role={}", 
+                    userDetail.isSuccess(), userDetail.getUsername(), userDetail.getRole());
+                return userDetail;
+            } else {
+                log.warn("No username found in CAS response");
+                return CasUserDetail.failure();
+            }
+            
+        } catch (Exception e) {
+            log.error("Error parsing XML response", e);
+            return CasUserDetail.failure();
         }
     }
     
@@ -178,42 +252,35 @@ public class CasRestClient {
             return CasLoginResult.failure("Failed to obtain service ticket");
         }
         
-        // Step 3: Validate ST
-        boolean isValid = validateServiceTicket(serviceTicket, casConfig.getClientServiceUrl());
-        if (!isValid) {
+        // Step 3: Validate ST and get user details
+        CasUserDetail userDetail = validateServiceTicket(serviceTicket, casConfig.getClientServiceUrl());
+        if (!userDetail.isSuccess()) {
             return CasLoginResult.failure("Service ticket validation failed");
         }
         
         // Generate CASTGC cookie value (this would typically be set by the browser)
         String castgcCookie = "CASTGC=" + tgt + "; Path=/; Secure; HttpOnly";
         
-        return CasLoginResult.success(serviceTicket, castgcCookie);
+        return CasLoginResult.success(serviceTicket, castgcCookie, userDetail);
     }
-    
-    public static class CasLoginResult {
-        private final boolean success;
-        private final String message;
-        private final String serviceTicket;
-        private final String castgcCookie;
-        
-        private CasLoginResult(boolean success, String message, String serviceTicket, String castgcCookie) {
-            this.success = success;
-            this.message = message;
-            this.serviceTicket = serviceTicket;
-            this.castgcCookie = castgcCookie;
+
+    /**
+     * Complete CAS authen flows
+     */
+    public CasAuthenResult performAuthen(String tgt){
+        if(tgt == null){
+            return CasAuthenResult.failure("Failed to obtain TGT");
         }
-        
-        public static CasLoginResult success(String serviceTicket, String castgcCookie) {
-            return new CasLoginResult(true, "Login successful", serviceTicket, castgcCookie);
+        // Step 1: Request ST
+        String serviceTicket = requestServiceTicket(tgt, casConfig.getClientServiceUrl(),null, null);
+        if (serviceTicket == null) {
+            return CasAuthenResult.failure("Failed to obtain service ticket");
         }
-        
-        public static CasLoginResult failure(String message) {
-            return new CasLoginResult(false, message, null, null);
+        // Step 2: Validate ST and get user details
+        CasUserDetail userDetail = validateServiceTicket(serviceTicket, casConfig.getClientServiceUrl());
+        if (!userDetail.isSuccess()) {
+            return CasAuthenResult.failure("Service ticket validation failed");
         }
-        
-        public boolean isSuccess() { return success; }
-        public String getMessage() { return message; }
-        public String getServiceTicket() { return serviceTicket; }
-        public String getCastgcCookie() { return castgcCookie; }
+        return CasAuthenResult.success(serviceTicket);
     }
 } 
